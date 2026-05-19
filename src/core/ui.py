@@ -194,7 +194,7 @@ class CercusCalibratorUI(ctk.CTk):
 
     # ────────────────────────────────────────── state machine
     @property
-    def state(self):
+    def ui_state(self):
         return self._state
 
     def _enter(self, new_state: str):
