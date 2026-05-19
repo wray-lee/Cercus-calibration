@@ -2,7 +2,7 @@
 hardware.py — Serial data acquisition for Cercus-Calibrator.
 
 Expected MCU line format (comma-separated):
-    sys_time, dx1, dy1, dx2, dy2
+    sys_time, x_dx, x_dy, y_dx, y_dy
 
 Runs in a daemon thread; all public buffers are thread-safe.
 """
@@ -19,7 +19,8 @@ import serial.tools.list_ports
 class SerialReader:
     """High-frequency serial reader running in a daemon thread.
 
-    Collects (dx1, dy1, dx2, dy2) tuples into a thread-safe deque.
+    Collects (x_dx, x_dy, y_dx, y_dy) tuples into a thread-safe deque.
+    The timestamp from the MCU is used only for live display, not buffered.
     """
 
     def __init__(self, port: str, baudrate: int = 115200, max_samples: int = 100_000):
@@ -46,8 +47,6 @@ class SerialReader:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=1.5)
-        if self._ser and self._ser.is_open:
-            self._ser.close()
         with self._lock:
             return list(self._buffer)
 
@@ -83,32 +82,37 @@ class SerialReader:
 
     # --------------------------------------------------------------- internal
     def _read_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                raw = self._ser.readline()
-                if not raw:
-                    self._stop_event.wait(timeout=0.05)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    raw = self._ser.readline()
+                    if not raw:
+                        self._stop_event.wait(timeout=0.05)
+                        continue
+                    text = raw.decode("utf-8", errors="ignore").strip()
+                    if not text:
+                        continue
+                    parts = text.split(",")
+                    if len(parts) < 5:
+                        continue
+                    # Format: t, x_dx, x_dy, y_dx, y_dy
+                    x_dx, x_dy, y_dx, y_dy = (
+                        float(parts[1]),
+                        float(parts[2]),
+                        float(parts[3]),
+                        float(parts[4]),
+                    )
+                    with self._lock:
+                        self._latest = (x_dx, x_dy, y_dx, y_dy)
+                        self._buffer.append(self._latest)
+                except (serial.SerialException, OSError):
+                    self._stop_event.set()
+                    break
+                except (ValueError, IndexError):
                     continue
-                text = raw.decode("utf-8", errors="ignore").strip()
-                if not text:
-                    continue
-                parts = text.split(",")
-                if len(parts) < 5:
-                    continue
-                dx1, dy1, dx2, dy2 = (
-                    float(parts[1]),
-                    float(parts[2]),
-                    float(parts[3]),
-                    float(parts[4]),
-                )
-                with self._lock:
-                    self._latest = (dx1, dy1, dx2, dy2)
-                    self._buffer.append(self._latest)
-            except (serial.SerialException, OSError):
-                self._stop_event.set()
-                break
-            except (ValueError, IndexError):
-                continue
+        finally:
+            if self._ser and self._ser.is_open:
+                self._ser.close()
 
 
 def list_serial_ports() -> List[str]:

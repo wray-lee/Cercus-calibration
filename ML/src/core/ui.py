@@ -5,14 +5,17 @@ State machine:
     IDLE  →  COLLECTING  →  TRAINING  →  DONE
 """
 
+import csv
+import os
 import queue
 import threading
 import time
+from datetime import datetime
 from typing import Optional, List
 import customtkinter as ctk
 
 from src.core.hardware import SerialReader, list_serial_ports
-from src.model.optimizer import Calibrator, build_matrix_3x3, save_json
+from src.model.optimizer import Calibrator, save_json
 
 
 class CercusCalibratorUI(ctk.CTk):
@@ -48,7 +51,10 @@ class CercusCalibratorUI(ctk.CTk):
         self._data_after_id: Optional[str] = None
         self._train_after_id: Optional[str] = None
         self._queue: queue.Queue = queue.Queue()
-        self._samples: List = []
+        self._samples: List = []  # kept for backward compat, no longer primary
+        self._current_csv: Optional[str] = None
+        self._csv_file = None
+        self._csv_writer = None
         self._collect_start_time: float = 0.0
         self._noise_threshold: Optional[float] = None
 
@@ -70,9 +76,18 @@ class CercusCalibratorUI(ctk.CTk):
         )
         self._port_menu.pack(side="left", padx=4)
 
-        ctk.CTkButton(
+        ctk.CTkLabel(top, text="Baud:").pack(side="left", padx=(8, 4))
+        self._baud_var = ctk.StringVar(value="115200")
+        self._baud_menu = ctk.CTkOptionMenu(
+            top, variable=self._baud_var,
+            values=["9600", "115200", "256000"], width=100
+        )
+        self._baud_menu.pack(side="left", padx=4)
+
+        self._btn_refresh = ctk.CTkButton(
             top, text="Refresh", width=60, command=self._refresh_ports
-        ).pack(side="left", padx=4)
+        )
+        self._btn_refresh.pack(side="left", padx=4)
 
         self._connect_btn = ctk.CTkButton(
             top, text="Connect", width=72, command=self._toggle_connect
@@ -89,7 +104,7 @@ class CercusCalibratorUI(ctk.CTk):
 
         row_a = ctk.CTkFrame(mid, fg_color="transparent")
         row_a.pack(fill="x", padx=10, pady=(10, 2))
-        ctk.CTkLabel(row_a, text="S_A  (dx, dy):", font=("", 13)).pack(
+        ctk.CTkLabel(row_a, text="Sensor  (x_dx, x_dy):", font=("", 13)).pack(
             side="left", padx=(0, 8)
         )
         self._lbl_sa = ctk.CTkLabel(
@@ -99,7 +114,7 @@ class CercusCalibratorUI(ctk.CTk):
 
         row_b = ctk.CTkFrame(mid, fg_color="transparent")
         row_b.pack(fill="x", padx=10, pady=(2, 10))
-        ctk.CTkLabel(row_b, text="S_B  (dx, dy):", font=("", 13)).pack(
+        ctk.CTkLabel(row_b, text="Sensor  (y_dx, y_dy):", font=("", 13)).pack(
             side="left", padx=(0, 8)
         )
         self._lbl_sb = ctk.CTkLabel(
@@ -124,19 +139,27 @@ class CercusCalibratorUI(ctk.CTk):
 
         self._btn_start = ctk.CTkButton(
             ctrl,
-            text="Start Data Collection",
+            text="Start Collection",
             height=36,
             command=self._start_collect,
         )
-        self._btn_start.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self._btn_start.pack(side="left", expand=True, fill="x", padx=(0, 2))
 
         self._btn_stop = ctk.CTkButton(
             ctrl,
-            text="Stop & Start Training",
+            text="Stop Collection",
             height=36,
-            command=self._stop_and_train,
+            command=self._stop_collect,
         )
-        self._btn_stop.pack(side="left", expand=True, fill="x", padx=(4, 0))
+        self._btn_stop.pack(side="left", expand=True, fill="x", padx=2)
+
+        self._btn_train = ctk.CTkButton(
+            ctrl,
+            text="Start Training",
+            height=36,
+            command=self._prepare_training,
+        )
+        self._btn_train.pack(side="left", expand=True, fill="x", padx=(2, 0))
 
         self._pbar = ctk.CTkProgressBar(bot)
         self._pbar.pack(fill="x", padx=8, pady=4)
@@ -167,17 +190,23 @@ class CercusCalibratorUI(ctk.CTk):
             self._log("⚠  No serial port selected.")
             return
         try:
-            self._reader = SerialReader(port, baudrate=115200)
+            baudrate = int(self._baud_var.get())
+            self._reader = SerialReader(port, baudrate=baudrate)
             self._reader.start()
             self._status_dot.configure(text_color=self.COLORS["green"])
             self._connect_btn.configure(text="Disconnect")
             self._log(f"✔  Connected to {port}")
             self._start_data_poll()
+            self._update_controls()
+
         except Exception as e:
             self._log(f"✘  Connection failed: {e}")
             self._reader = None
 
     def _disconnect(self):
+        # Flush in-flight collection before tearing down hardware
+        if self._state == self.COLLECTING:
+            self._stop_collect()
         if self._reader:
             try:
                 self._reader.stop()
@@ -205,11 +234,23 @@ class CercusCalibratorUI(ctk.CTk):
         s = self._state
         serial_ok = self._reader is not None and self._reader.is_running
 
+        # Port / baud controls locked while connected
+        conn_state = "disabled" if serial_ok else "normal"
+        self._port_menu.configure(state=conn_state)
+        self._baud_menu.configure(state=conn_state)
+        self._btn_refresh.configure(state=conn_state)
+
+        # Start Collection: IDLE or DONE + serial connected
         self._btn_start.configure(
-            state="normal" if (s in (self.IDLE, self.DONE) and serial_ok) else "disabled"
+            state=(
+                "normal" if (s in (self.IDLE, self.DONE) and serial_ok) else "disabled"
+            )
         )
-        self._btn_stop.configure(
-            state="normal" if s == self.COLLECTING else "disabled"
+        # Stop Collection: only while COLLECTING
+        self._btn_stop.configure(state="normal" if s == self.COLLECTING else "disabled")
+        # Start Training: IDLE or DONE + CSV file exists on disk
+        self._btn_train.configure(
+            state="normal" if (s in (self.IDLE, self.DONE) and self._current_csv is not None) else "disabled"
         )
 
     # ────────────────────────────────────────── collection
@@ -217,26 +258,57 @@ class CercusCalibratorUI(ctk.CTk):
         if self._state not in (self.IDLE, self.DONE) or not self._reader:
             return
         self._reader.clear_buffer()
+
+        # Create timestamped CSV for incremental writes
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._current_csv = os.path.join(os.path.dirname(__file__), "..", "..", f"collect_{ts}.csv")
+        self._current_csv = os.path.normpath(self._current_csv)
+        self._samples = []  # clear legacy buffer
+        try:
+            self._csv_file = open(self._current_csv, "w", newline="")
+        except OSError as e:
+            self._log(f"✘  Failed to create CSV: {e}")
+            self._current_csv = None
+            return
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow(["x_dx", "x_dy", "y_dx", "y_dy"])
+        self._csv_file.flush()
         self._enter(self.COLLECTING)
         self._collect_start_time = time.monotonic()
         self._start_timer()
-        self._log("▸  Data collection started …")
+        self._log(f"▸  Data collection started → {os.path.basename(self._current_csv)}")
 
-    def _stop_and_train(self):
+    def _stop_collect(self):
         if self._state != self.COLLECTING:
             return
         self._stop_timer()
 
-        self._samples = self._reader.snapshot_and_clear()
+        # Flush any residual data from the serial buffer to CSV
+        if self._csv_writer and self._reader:
+            residual = self._reader.snapshot_and_clear()
+            for row in residual:
+                self._csv_writer.writerow(row)
 
-        n = len(self._samples)
-        self._log(f"■  Collection stopped — {n} samples")
-        if n < 10:
-            self._log("✘  Too few samples to calibrate.")
-            self._show_insufficient_dialog(n)
-            self._enter(self.IDLE)
-            return
-        self._launch_training()
+        # Close persistent file handle
+        if self._csv_file:
+            try:
+                self._csv_file.close()
+            except OSError as e:
+                self._log(f"⚠  CSV close error: {e}")
+            self._csv_file = None
+            self._csv_writer = None
+
+        # Count total rows written
+        n = 0
+        if self._current_csv and os.path.isfile(self._current_csv):
+            try:
+                with open(self._current_csv, "r") as f:
+                    n = max(0, sum(1 for _ in f) - 1)  # exclude header
+            except OSError:
+                pass
+
+        self._log(f"■  Collection stopped — {n} samples saved to {os.path.basename(self._current_csv or '')}")
+        self._enter(self.IDLE)
 
     def _show_insufficient_dialog(self, sample_count: int):
         dlg = ctk.CTkToplevel(self)
@@ -261,7 +333,7 @@ class CercusCalibratorUI(ctk.CTk):
         ctk.CTkLabel(
             frame,
             text=f"Only {sample_count} sample(s) collected.\n"
-                 f"At least 10 are required for calibration.",
+            f"At least 10 are required for calibration.",
             font=("", 14),
             justify="center",
         ).pack(pady=(0, 12))
@@ -302,23 +374,64 @@ class CercusCalibratorUI(ctk.CTk):
         if self._reader and not self._reader.is_running:
             self._log("⚠  Hardware disconnected unexpectedly.")
             self._disconnect()
-            if self._state == self.COLLECTING:
-                self._stop_timer()
-                self._enter(self.IDLE)
             return
 
         if not self._reader:
             return
 
+        # Incremental CSV flush while collecting
+        if self._state == self.COLLECTING and self._csv_writer:
+            chunk = self._reader.snapshot_and_clear()
+            if chunk:
+                for row in chunk:
+                    self._csv_writer.writerow(row)
+                self._csv_file.flush()
+
+        # Update live display from latest reading
         reading = self._reader.latest
         if reading:
-            dx1, dy1, dx2, dy2 = reading
-            self._lbl_sa.configure(text=f"{dx1:+.2f} , {dy1:+.2f}")
-            self._lbl_sb.configure(text=f"{dx2:+.2f} , {dy2:+.2f}")
+            x_dx, x_dy, y_dx, y_dy = reading
+            self._lbl_sa.configure(text=f"{x_dx:+.2f} , {x_dy:+.2f}")
+            self._lbl_sb.configure(text=f"{y_dx:+.2f} , {y_dy:+.2f}")
         self._data_after_id = self.after(self.DATA_POLL_MS, self._data_tick)
 
     # ────────────────────────────────────────── training
-    def _launch_training(self):
+    def _prepare_training(self):
+        if self._state not in (self.IDLE, self.DONE):
+            return
+
+        if not self._current_csv or not os.path.isfile(self._current_csv):
+            self._log("✘  No CSV data found. Please collect data first.")
+            return
+
+        # Read and validate CSV
+        data = []
+        try:
+            with open(self._current_csv, "r", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)  # skip header
+                valid_headers = [["x_dx", "x_dy", "y_dx", "y_dy"], ["dx1", "dy1", "dx2", "dy2"]]
+                if header not in valid_headers:
+                    self._log("✘  CSV header mismatch. File may be corrupted.")
+                    return
+                for row in reader:
+                    try:
+                        data.append(tuple(float(v) for v in row))
+                    except ValueError:
+                        continue  # skip malformed rows
+        except OSError as e:
+            self._log(f"✘  Failed to read CSV: {e}")
+            return
+
+        if len(data) < 10:
+            self._log(f"✘  Too few samples ({len(data)}) to calibrate. Need at least 10.")
+            self._show_insufficient_dialog(len(data))
+            return
+
+        self._log(f"▸  Loaded {len(data)} samples from {os.path.basename(self._current_csv)}")
+        self._launch_training(data)
+
+    def _launch_training(self, data: list):
         self._enter(self.TRAINING)
         self._pbar.set(0)
         self._log("▸  Training started (1000 epochs) …")
@@ -326,7 +439,7 @@ class CercusCalibratorUI(ctk.CTk):
         cal = Calibrator()
         thread = threading.Thread(
             target=self._train_worker,
-            args=(cal, self._samples, self._queue, self._noise_threshold),
+            args=(cal, data, self._queue, self._noise_threshold),
             daemon=True,
         )
         thread.start()
@@ -340,14 +453,17 @@ class CercusCalibratorUI(ctk.CTk):
         noise_threshold: Optional[float] = None,
     ):
         try:
+
             def cb(epoch, total, loss_val):
                 q.put(("progress", epoch / total, epoch, loss_val))
 
-            W_a, final_loss = cal.run(
-                data, epochs=1000, progress_cb=cb, noise_threshold=noise_threshold,
+            cal_matrix, final_loss = cal.run(
+                data,
+                epochs=1000,
+                progress_cb=cb,
+                noise_threshold=noise_threshold,
             )
-            mat = build_matrix_3x3(W_a)
-            save_json(mat)
+            save_json(cal_matrix)
             q.put(("done", final_loss))
         except Exception as e:
             q.put(("error", str(e)))
@@ -365,8 +481,9 @@ class CercusCalibratorUI(ctk.CTk):
                     _, final_loss = msg
                     self._pbar.set(1.0)
                     self._log(f"✔  Training complete — Loss: {final_loss:.6f}")
-                    self._log("✔  Calibration Saved Successfully → calibration_cfg.json")
-                    self._samples = []
+                    self._log(
+                        "✔  Calibration Saved Successfully → calibration_cfg.json"
+                    )
                     self._enter(self.DONE)
                     return
                 elif kind == "error":
@@ -393,4 +510,11 @@ class CercusCalibratorUI(ctk.CTk):
             self.after_cancel(self._train_after_id)
         if self._reader:
             self._disconnect()
+        if self._csv_file:
+            try:
+                self._csv_file.close()
+            except OSError:
+                pass
+            self._csv_file = None
+            self._csv_writer = None
         self.destroy()
