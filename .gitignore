@@ -1,0 +1,4 @@
+.vscode
+.claude
+*.json
+__pycache__
