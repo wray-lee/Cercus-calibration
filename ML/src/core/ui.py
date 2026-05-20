@@ -79,8 +79,7 @@ class CercusCalibratorUI(ctk.CTk):
         ctk.CTkLabel(top, text="Baud:").pack(side="left", padx=(8, 4))
         self._baud_var = ctk.StringVar(value="115200")
         self._baud_menu = ctk.CTkOptionMenu(
-            top, variable=self._baud_var,
-            values=["9600", "115200", "256000"], width=100
+            top, variable=self._baud_var, values=["9600", "115200", "256000"], width=100
         )
         self._baud_menu.pack(side="left", padx=4)
 
@@ -250,7 +249,11 @@ class CercusCalibratorUI(ctk.CTk):
         self._btn_stop.configure(state="normal" if s == self.COLLECTING else "disabled")
         # Start Training: IDLE or DONE + CSV file exists on disk
         self._btn_train.configure(
-            state="normal" if (s in (self.IDLE, self.DONE) and self._current_csv is not None) else "disabled"
+            state=(
+                "normal"
+                if (s in (self.IDLE, self.DONE) and self._current_csv is not None)
+                else "disabled"
+            )
         )
 
     # ────────────────────────────────────────── collection
@@ -261,7 +264,9 @@ class CercusCalibratorUI(ctk.CTk):
 
         # Create timestamped CSV for incremental writes
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._current_csv = os.path.join(os.path.dirname(__file__), "..", "..", f"collect_{ts}.csv")
+        self._current_csv = os.path.join(
+            os.path.dirname(__file__), "..", "..", f"collect_{ts}.csv"
+        )
         self._current_csv = os.path.normpath(self._current_csv)
         self._samples = []  # clear legacy buffer
         try:
@@ -307,7 +312,9 @@ class CercusCalibratorUI(ctk.CTk):
             except OSError:
                 pass
 
-        self._log(f"■  Collection stopped — {n} samples saved to {os.path.basename(self._current_csv or '')}")
+        self._log(
+            f"■  Collection stopped — {n} samples saved to {os.path.basename(self._current_csv or '')}"
+        )
         self._enter(self.IDLE)
 
     def _show_insufficient_dialog(self, sample_count: int):
@@ -410,7 +417,10 @@ class CercusCalibratorUI(ctk.CTk):
             with open(self._current_csv, "r", newline="") as f:
                 reader = csv.reader(f)
                 header = next(reader, None)  # skip header
-                valid_headers = [["x_dx", "x_dy", "y_dx", "y_dy"], ["dx1", "dy1", "dx2", "dy2"]]
+                valid_headers = [
+                    ["x_dx", "x_dy", "y_dx", "y_dy"],
+                    ["dx1", "dy1", "dx2", "dy2"],
+                ]
                 if header not in valid_headers:
                     self._log("✘  CSV header mismatch. File may be corrupted.")
                     return
@@ -424,17 +434,21 @@ class CercusCalibratorUI(ctk.CTk):
             return
 
         if len(data) < 10:
-            self._log(f"✘  Too few samples ({len(data)}) to calibrate. Need at least 10.")
+            self._log(
+                f"✘  Too few samples ({len(data)}) to calibrate. Need at least 10."
+            )
             self._show_insufficient_dialog(len(data))
             return
 
-        self._log(f"▸  Loaded {len(data)} samples from {os.path.basename(self._current_csv)}")
+        self._log(
+            f"▸  Loaded {len(data)} samples from {os.path.basename(self._current_csv)}"
+        )
         self._launch_training(data)
 
     def _launch_training(self, data: list):
         self._enter(self.TRAINING)
         self._pbar.set(0)
-        self._log("▸  Training started (1000 epochs) …")
+        self._log("▸  Training started (10000 epochs) …")
 
         cal = Calibrator()
         thread = threading.Thread(
@@ -459,7 +473,7 @@ class CercusCalibratorUI(ctk.CTk):
 
             cal_matrix, final_loss = cal.run(
                 data,
-                epochs=1000,
+                epochs=10000,
                 progress_cb=cb,
                 noise_threshold=noise_threshold,
             )

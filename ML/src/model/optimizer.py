@@ -10,10 +10,10 @@ Core idea (autoencoder bottleneck):
     the production calibration matrix W_calib ∈ R^{3×3}.
 
 Channel layout (0-indexed in the 4-DOF tensor):
-    0  x_dx  — production X axis
-    1  x_dy  — cross-talk (should map to ~zero)
-    2  y_dx  — production Y axis
-    3  y_dy  — cross-talk / yaw constraint (should map to ~zero)
+    0  x_dx  — physical X (roll)    → UI X
+    1  x_dy  — physical Z (yaw)     → UI Z
+    2  y_dx  — physical Y (pitch)   → UI Y
+    3  y_dy  — cross-talk / unused
 
 Production input mapping (calibration.cpp → main.cpp):
     x_dx → system X,  y_dx → system Y,  x_dy → system Z
@@ -78,15 +78,16 @@ class Calibrator:
     Hyperparameters
     ---------------
     anchor_val : float
-        Hard-coded value for encoder weight [0, 0] to break scale symmetry.
+        Hard-coded value for encoder weight [0, 2] to break scale symmetry.
     reg_lambda : float
-        Weight of the cross-talk regularizer in the total loss.
+        Weight of the correlation regularizer in the total loss.
     lr : float
         Adam learning rate.
     """
 
+    # Anchor Latent X (Row 0) to Sensor Y's dx (Col 2)
     ANCHOR_ROW = 0
-    ANCHOR_COL = 0
+    ANCHOR_COL = 2
     LOG_INTERVAL = 10  # epochs between progress callbacks
     EARLY_STOP_WINDOW = 20
     EARLY_STOP_TOL = 1e-6
@@ -94,51 +95,50 @@ class Calibrator:
     def __init__(
         self,
         base_scale: float = mapScale,
-        reg_lambda: float = 0.5,
+        reg_lambda: float = 0.1,  # Balanced penalty for L2
         lr: float = 0.01,
     ):
         self.reg_lambda = reg_lambda
         self.lr = lr
         self.anchor_val = base_scale
 
-        # --- Inject Physical Priors ---
-        # 4-DOF Columns: 0: x_dx, 1: x_dy, 2: y_dx, 3: y_dy
-        # 3-DOF Latent:  0: X,    1: Y,    2: Z
-        # Ideal mapping: X <- x_dx (0,0), Y <- y_dx (1,2), Z <- x_dy (2,1)
+        # --- Strict Diagonal Physical Priors ---
         init_enc = torch.zeros(3, 4)
-        init_enc[0, 0] = base_scale
-        init_enc[1, 2] = base_scale
-        init_enc[2, 1] = base_scale
-        self.W_enc = torch.nn.Parameter(init_enc + torch.randn(3, 4) * 0.001)
+        init_enc[0, 0] = base_scale  # raw_dx (S col 0) -> UI X
+        init_enc[1, 2] = base_scale  # raw_dy (S col 2) -> UI Y
+        init_enc[2, 1] = base_scale  # raw_dz (S col 1) -> UI Z
+        self.W_enc = torch.nn.Parameter(init_enc + torch.randn(3, 4) * 0.0001)
 
         init_dec = torch.zeros(4, 3)
         init_dec[0, 0] = 1.0 / base_scale
         init_dec[2, 1] = 1.0 / base_scale
         init_dec[1, 2] = 1.0 / base_scale
-        self.W_dec = torch.nn.Parameter(init_dec + torch.randn(4, 3) * 0.001)
+        self.W_dec = torch.nn.Parameter(init_dec + torch.randn(4, 3) * 0.0001)
 
-        # Build structural mask for cross-talk penalty (0 for primary, 1 for crosstalk)
+        # L2 Penalty Mask
         self.reg_mask = torch.ones(3, 4)
-        self.reg_mask[0, 0] = 0.0  # Allow x_dx -> X
-        self.reg_mask[1, 2] = 0.0  # Allow y_dx -> Y
-        self.reg_mask[2, 1] = 0.0  # Allow x_dy -> Z
+        self.reg_mask[0, 0] = 0.0  # Main UI X
+        self.reg_mask[1, 2] = 0.0  # Main UI Y
+        self.reg_mask[2, 1] = 0.0  # Main UI Z
 
     def loss(self, S: torch.Tensor) -> torch.Tensor:
-        # Forward pass: 4D -> 3D -> 4D
         latent = S @ self.W_enc.T
         S_pred = latent @ self.W_dec.T
-        recon = torch.mean((S - S_pred) ** 2)
 
-        # Cross-talk regularizer: explicitly penalize non-primary matrix paths
-        # Ensures y_dy (col 3) drives error correction without hijacking axes
-        reg = torch.sum((self.W_enc * self.reg_mask) ** 2)
+        # 1. Scale-invariant reconstruction loss
+        recon = torch.mean((S - S_pred) ** 2) / (torch.var(S) + 1e-6)
 
-        return recon + self.reg_lambda * reg
+        # 2. L2 Ridge Penalty on Cross-talk
+        # Punish the absolute magnitude of cross-talk weights relative to base_scale
+        # This prevents noise amplification while allowing soft geometric corrections.
+        l2_penalty = torch.sum(((self.W_enc * self.reg_mask) / self.anchor_val) ** 2)
+
+        return recon + self.reg_lambda * l2_penalty
 
     def run(
         self,
         raw_data: list,
-        epochs: int = 1000,
+        epochs: int = 10000,
         progress_cb: Optional[Callable[[int, int, float], None]] = None,
         noise_threshold: Optional[float] = None,
     ) -> Tuple[list, float]:
@@ -154,9 +154,11 @@ class Calibrator:
             l.backward()
             optimizer.step()
 
-            # 强制锁定锚点，防止正则化主导引发的尺度塌陷与逆矩阵爆炸
+            # 强制锁定三个主物理轴，阻止绝对尺度爆炸
             with torch.no_grad():
-                self.W_enc[self.ANCHOR_ROW, self.ANCHOR_COL] = self.anchor_val
+                self.W_enc[0, 0] = self.anchor_val  # raw_dx -> UI X
+                self.W_enc[1, 2] = self.anchor_val  # raw_dy -> UI Y
+                self.W_enc[2, 1] = self.anchor_val  # raw_dz -> UI Z
 
             loss_val = l.item()
             loss_history.append(loss_val)
@@ -182,26 +184,26 @@ class Calibrator:
 
 
 def build_calibration_matrix(W_enc: torch.Tensor) -> list:
-    """Extract the 3×3 production sub-matrix from the encoder and invert it.
+    """Derive the 3x3 production calibration matrix.
 
-    The encoder weight matrix P has shape [3, 4].  The sub-matrix P_sub is
-    formed by selecting the rows corresponding to the three production input
-    channels (x_dx, y_dx, x_dy) and the first 3 output columns:
+    The autoencoder latent space (Outputs) is: [X_real, Y_real, Z_real]
+    The autoencoder input space (S) is: [x_dx (0), x_dy (1), y_dx (2), y_dy (3)]
 
-        P_sub[i, j] = W_enc[j, _PRODUCTION_ROWS[i]]
+    In the production engine (hardware.py), the math is:
+    Out = M * [raw_dx, raw_dy, raw_dz]^T
 
-    The calibration matrix is ``W_calib = inv(P_sub)``.
+    Assuming the physical firmware mapping is:
+    raw_dx == x_dx (S col 0)
+    raw_dy == y_dx (S col 2)
+    raw_dz == x_dy (S col 1)
 
-    Returns
-    -------
-    list[list[float]]  — 3×3 JSON-serializable matrix
+    We must build a 3x3 matrix M where rows are outputs and columns match
+    the [0, 2, 1] input sequence.
     """
-    P_sub = W_enc.T[[0, 2, 1], :]
-    # W_calib = torch.linalg.inv(P_sub)
-    # if not torch.isfinite(W_calib).all():
-    #     raise ValueError("Calibration matrix contains NaN or Inf values.")
-    # return W_calib.numpy().tolist()
-    return P_sub.numpy().tolist()
+    # Extract the required columns for [raw_dx, raw_dy, raw_dz]
+    M = W_enc[:, [0, 2, 1]]
+
+    return M.detach().numpy().tolist()
 
 
 def save_json(matrix: list, path: str = "calibration_cfg.json"):
