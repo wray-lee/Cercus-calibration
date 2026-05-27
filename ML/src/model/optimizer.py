@@ -21,10 +21,11 @@ Production input mapping (calibration.cpp → main.cpp):
 
 import json
 from typing import Callable, Optional, Tuple
+import math
 
 import torch
 
-mapScale: float = 0.015
+mapScale: float = 60 * math.pi / 4000
 
 
 def load_data(
